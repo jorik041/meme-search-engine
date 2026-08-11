@@ -41,7 +41,7 @@ url = "2"
 fastrand = "2"
 mimalloc = "0.1"
 sonic-rs = "0.3"
-ffmpeg-the-third = "4.0"
+ffmpeg-the-third = "5.0"
 compact_str = { version = "0.8.0-beta", features = ["serde"] }
 itertools = "0.13"
 async-recursion = "1"

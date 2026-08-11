@@ -7,7 +7,7 @@ use ffmpeg::{codec, filter, format::{self, Pixel}, media::Type, util::frame::vid
 const BYTES_PER_PIXEL: usize = 3;
 
 pub fn run<P: AsRef<std::path::Path>, F: FnMut(RgbImage) -> Result<()>>(path: P, mut frame_callback: F, frame_interval: f32) -> Result<()> {
-    let mut ictx = format::input(&path).context("parsing video")?;
+    let mut ictx = format::input(path.as_ref().as_os_str()).context("parsing video")?;
     let video = ictx.streams().best(Type::Video).context("no video stream")?;
     let video_index = video.index();
 
