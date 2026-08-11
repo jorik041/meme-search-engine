@@ -110,7 +110,8 @@ struct VisitedNode {
     id: u32,
     score: i64,
     timestamp: u64,
-    dimensions: (u32, u32)
+    dimensions: (u32, u32),
+    embedding: Vec<u8>
 }
 
 struct Scratch {
@@ -177,7 +178,8 @@ async fn greedy_search<'a>(scratch: &mut Scratch, start: u32, query: &[f16], que
                     id: node.id,
                     score,
                     timestamp: node.timestamp,
-                    dimensions: node.dimensions
+                    dimensions: node.dimensions,
+                    embedding: node.vector.iter().flat_map(|x| x.to_le_bytes()).collect()
                 });
                 scratch.visited_embeddings.extend(bytemuck::cast_slice(&node.vector).iter().map(|x: &f16| x.to_f32()));
             };
@@ -418,6 +420,9 @@ impl hyper::service::Service<Request<Incoming>> for Service {
                     predefined_embedding_names: config.descriptor_names.clone()
                 })?))),
                 (&Method::POST, "/") => {
+                    let msgpack = req.headers().get(hyper::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| value.split(';').next() == Some("application/msgpack"));
                     let upper = req.body().size_hint().upper().unwrap_or(u64::MAX);
                     if upper > 1<<23 {
                         let mut resp = Response::new(Full::new(Bytes::from("Body too big")));
@@ -427,7 +432,11 @@ impl hyper::service::Service<Request<Incoming>> for Service {
 
                     let whole_body = req.collect().await?.to_bytes();
 
-                    let body: QueryRequest = serde_json::from_slice(&whole_body)?;
+                    let body: QueryRequest = if msgpack {
+                        rmp_serde::from_slice(&whole_body)?
+                    } else {
+                        serde_json::from_slice(&whole_body)?
+                    };
 
                     let query = common::get_total_embedding(
                         &body.terms,
@@ -528,27 +537,38 @@ impl hyper::service::Service<Request<Incoming>> for Service {
 
                     scratch.visited_list.sort_unstable_by_key(|x| -x.score);
 
-                    let matches = scratch.visited_list
-                        .drain(..)
-                        .map(|node| {
+                    if msgpack {
+                        #[derive(Serialize)]
+                        struct MsgpackResult {
+                            matches: Vec<(f32, String, String, u64, Option<(u32, u32)>, Option<(Vec<f32>, Vec<u32>, u64)>, serde_bytes::ByteBuf)>,
+                            formats: Vec<String>,
+                            extensions: HashMap<String, String>,
+                        }
+
+                        let matches = scratch.visited_list.drain(..).map(|node| {
+                            let debug = if body.debug_enabled {
+                                Some((node.scores, node.shards, node.timestamp))
+                            } else {
+                                None
+                            };
+                            ((node.score as f64 / SCALE_F64) as f32, node.image_url, String::new(), 0, Some(node.dimensions), debug, serde_bytes::ByteBuf::from(node.embedding))
+                        }).collect();
+                        let result = MsgpackResult { formats: vec![], extensions: HashMap::new(), matches };
+                        Response::builder()
+                            .header(hyper::header::CONTENT_TYPE, "application/msgpack")
+                            .body(Full::new(Bytes::from(rmp_serde::to_vec_named(&result)?)))?
+                    } else {
+                        let matches = scratch.visited_list.drain(..).map(|node| {
                             let debug = if body.debug_enabled {
                                 Some((node.scores, node.shards, node.timestamp))
                             } else {
                                 None
                             };
                             ((node.score as f64 / SCALE_F64) as f32, node.image_url, String::new(), 0, Some(node.dimensions), debug)
-                        })
-                        .collect::<Vec<_>>();
-
-                    let result = QueryResult {
-                        formats: vec![],
-                        extensions: HashMap::new(),
-                        matches
-                    };
-
-                    let result = serde_json::to_vec(&result)?;
-
-                    Response::new(Full::new(Bytes::from(result)))
+                        }).collect::<Vec<_>>();
+                        let result = QueryResult { formats: vec![], extensions: HashMap::new(), matches };
+                        Response::new(Full::new(Bytes::from(serde_json::to_vec(&result)?)))
+                    }
                 },
                 (&Method::GET, "/metrics") => {
                     let mut buffer = Vec::new();

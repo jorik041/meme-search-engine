@@ -11,7 +11,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
     Router,
-    http::StatusCode
+    http::{HeaderMap, StatusCode}
 };
 use common::{resize_for_embed_sync, FrontendInit};
 use compact_str::CompactString;
@@ -93,6 +93,7 @@ struct WConfig {
 #[derive(Debug)]
 struct IIndex {
     vectors: scalar_quantizer::ScalarQuantizerIndexImpl,
+    embeddings: Vec<Vec<u8>>,
     filenames: Vec<Filename>,
     format_codes: Vec<u64>,
     format_names: Vec<String>,
@@ -820,6 +821,7 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
 
     let mut index = IIndex {
         vectors: scalar_quantizer::ScalarQuantizerIndexImpl::new(config.backend.embedding_size as u32, scalar_quantizer::QuantizerType::QT_fp16, faiss::MetricType::InnerProduct)?,
+        embeddings: Vec::new(),
         filenames: Vec::new(),
         format_codes: Vec::new(),
         format_names: Vec::new(),
@@ -848,6 +850,7 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
             };
 
             index.filenames.push(parsed);
+            index.embeddings.push(emb.clone());
             for i in (0..emb.len()).step_by(2) {
                 buffer.push(
                     half::f16::from_le_bytes([emb[i], emb[i + 1]])
@@ -896,7 +899,7 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
 }
 
 #[instrument(skip(index))]
-async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bool) -> Result<QueryResult<()>> {
+async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bool) -> Result<QueryResult<usize>> {
     let result = index.vectors.search(&query, k as usize)?;
 
     let mut seen_videos = HashSet::new();
@@ -921,7 +924,7 @@ async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bo
                 generate_filename_hash(&index.filenames[id as usize]).clone(),
                 index.format_codes[id],
                 index.metadata[id].as_ref().map(|x| (x.width, x.height)),
-                Option::<()>::None
+                Some(id)
             ))
         })
         .collect();
@@ -934,7 +937,7 @@ async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bo
 }
 
 #[instrument(skip(config, client, index))]
-async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IIndex, req: Json<QueryRequest>) -> Result<Response<Body>> {
+async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IIndex, req: QueryRequest, msgpack: bool) -> Result<Response<Body>> {
     let embedding = common::get_total_embedding(
         &req.terms,
         &config.backend,
@@ -957,11 +960,28 @@ async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IInde
         extensions.insert(k, v.extension);
     }
 
-    Ok(Json(QueryResult {
-        matches: qres.matches,
-        formats: qres.formats,
-        extensions,
-    }).into_response())
+    if msgpack {
+        let matches = qres.matches.into_iter().map(|(score, filename, thumbnail, formats, dimensions, id)| {
+            let embedding = serde_bytes::ByteBuf::from(index.embeddings[id.expect("query results always contain an index id")].clone());
+            (score, filename, thumbnail, formats, dimensions, Option::<()>::None, embedding)
+        }).collect();
+        let result = QueryResultMsgpack { matches, formats: qres.formats, extensions };
+        Ok(Response::builder()
+            .header("Content-Type", "application/msgpack")
+            .body(Body::from(rmp_serde::to_vec_named(&result)?))?)
+    } else {
+        let matches = qres.matches.into_iter().map(|(score, filename, thumbnail, formats, dimensions, _id)| {
+            (score, filename, thumbnail, formats, dimensions, Option::<()>::None)
+        }).collect();
+        Ok(Json(QueryResult { matches, formats: qres.formats, extensions }).into_response())
+    }
+}
+
+#[derive(Serialize)]
+struct QueryResultMsgpack {
+    matches: Vec<(f32, String, String, u64, Option<(u32, u32)>, Option<()>, serde_bytes::ByteBuf)>,
+    formats: Vec<String>,
+    extensions: HashMap<String, String>,
 }
 
 #[tokio::main]
@@ -1041,12 +1061,20 @@ async fn main() -> Result<()> {
     let index_ = index.clone();
     let config__ = config.clone();
     let app = Router::new()
-        .route("/", post(|req| async move {
+        .route("/", post(|headers: HeaderMap, body: axum::body::Bytes| async move {
             let config = config.clone();
             let index = index.read().await; // TODO: use ConcurrentIndex here
             let client = client.clone();
             QUERIES_COUNTER.inc();
-            handle_request(config, client.clone(), &index, req).await.map_err(|e| format!("{:?}", e))
+            let msgpack = headers.get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.split(';').next() == Some("application/msgpack"));
+            let req: QueryRequest = if msgpack {
+                rmp_serde::from_slice(&body).map_err(|e| format!("{:?}", e))?
+            } else {
+                serde_json::from_slice(&body).map_err(|e| format!("{:?}", e))?
+            };
+            handle_request(config, client.clone(), &index, req, msgpack).await.map_err(|e| format!("{:?}", e))
         }).layer(DefaultBodyLimit::max(2<<24)))
         .route("/", get(|_req: ()| async move {
             Json(FrontendInit {
